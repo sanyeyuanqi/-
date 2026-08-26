@@ -36,3 +36,9 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# nginx runtime data
+/nginx/certbot/conf/*
+!/nginx/certbot/conf/.gitkeep
+/nginx/certbot/www/*
+!/nginx/certbot/www/.gitkeep

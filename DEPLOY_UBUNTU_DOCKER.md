@@ -1,21 +1,21 @@
 # Ubuntu + Docker 生产环境部署教程
 
-本教程适用于当前 `gys-frontend` 项目，推荐 Ubuntu 22.04 或 24.04。应用运行在 Docker 容器中，Nginx 和 HTTPS 由 Ubuntu 宿主机管理。
+本教程适用于当前 `gys-frontend` 项目，推荐 Ubuntu 22.04 或 24.04。前端、Nginx 和 Certbot 均通过 Docker Compose 管理，Nginx 配置与 HTTPS 证书挂载到 Ubuntu 宿主机持久化保存。
 
 ```text
 浏览器
    |
    v
-Nginx :80/:443 (Ubuntu 宿主机)
+gys-nginx :80/:443
    |
    v
-127.0.0.1:3000 -> gys-frontend Docker 容器
-                         |
-                         v
-                  https://gys.oljuxj.xyz
+gys-frontend:3000 (仅 Docker 内部网络)
+   |
+   v
+https://gys.oljuxj.xyz
 ```
 
-这种方式不向公网直接暴露容器的 `3000` 端口。
+这种方式只向公网发布 Nginx 的 `80/443`，前端容器的 `3000` 端口不会映射到 Ubuntu 宿主机。
 
 ## 1. 准备服务器
 
@@ -44,7 +44,7 @@ sudo apt remove -y docker.io docker-compose docker-compose-v2 docker-doc \
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates curl git nginx
+sudo apt install -y ca-certificates curl git
 sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
   -o /etc/apt/keyrings/docker.asc
@@ -88,6 +88,9 @@ cd /opt/gys-frontend
 Dockerfile
 .dockerignore
 docker-compose.yml
+nginx/conf.d/default.conf
+nginx/conf.d/https.conf.example
+nginx/nginx.conf
 package.json
 package-lock.json
 ```
@@ -96,8 +99,9 @@ package-lock.json
 
 ```bash
 cd /opt/gys-frontend
-sudo docker compose build --pull
-sudo docker compose up -d
+sudo docker compose pull nginx
+sudo docker compose build --pull frontend
+sudo docker compose up -d frontend nginx
 ```
 
 首次构建会下载 Node.js 24 镜像和 npm 依赖，需要几分钟。Dockerfile 会自动执行：
@@ -113,13 +117,14 @@ npm run build
 ```bash
 sudo docker compose ps
 sudo docker inspect --format='{{.State.Health.Status}}' gys-frontend
-sudo docker compose logs --tail=100 frontend
+sudo docker inspect --format='{{.State.Health.Status}}' gys-nginx
+sudo docker compose logs --tail=100 frontend nginx
 ```
 
 当健康状态变为 `healthy` 后，在 Ubuntu 宿主机测试：
 
 ```bash
-curl -I http://127.0.0.1:3000/login
+curl -I http://127.0.0.1/login
 ```
 
 容器通过 Compose 的 `restart: unless-stopped` 在异常退出和服务器重启后自动恢复。
@@ -136,62 +141,67 @@ curl -I http://127.0.0.1:3000/login
 
 ### docker-compose.yml
 
-- 容器端口只绑定到宿主机 `127.0.0.1:3000`。
-- 根文件系统为只读，仅 `/tmp` 为临时可写目录。
-- 移除 Linux capabilities，禁止获取新权限。
+- 前端 `3000` 端口只向 Docker 内部网络开放。
+- Nginx 对外发布宿主机的 `80/443`，容器内使用非特权端口 `8080/8443`。
+- `nginx/conf.d` 只读挂载到 `/etc/nginx/conf.d`。
+- `nginx/certbot/conf` 挂载为证书持久化目录。
+- `nginx/certbot/www` 挂载为 ACME 域名验证目录。
+- 两个常驻容器的根文件系统均为只读，仅必要临时目录可写。
+- 前端移除全部 Linux capabilities；Nginx 仅保留工作进程降权所需的 `CHOWN/SETUID/SETGID`。
 - 限制日志文件大小，避免长期运行占满磁盘。
 
-## 6. 配置宿主机 Nginx
+## 6. Nginx 挂载说明
 
-将下面的 `example.com` 全部替换为你的真实域名。
+Compose 使用以下只读挂载：
+
+```yaml
+volumes:
+  - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  - ./nginx/conf.d:/etc/nginx/conf.d:ro
+  - ./nginx/certbot/www:/var/www/certbot:ro
+  - ./nginx/certbot/conf:/etc/letsencrypt:ro
+```
+
+修改宿主机中的 `nginx/conf.d/default.conf` 后，先检查配置再平滑重载：
 
 ```bash
-sudo tee /etc/nginx/sites-available/gys-frontend >/dev/null <<'EOF'
-server {
-    listen 80;
-    listen [::]:80;
-    server_name example.com;
-
-    client_max_body_size 10m;
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        proxy_connect_timeout 15s;
-        proxy_send_timeout 120s;
-        proxy_read_timeout 120s;
-    }
-}
-EOF
-
-sudo ln -s /etc/nginx/sites-available/gys-frontend \
-  /etc/nginx/sites-enabled/gys-frontend
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t
-sudo systemctl reload nginx
+cd /opt/gys-frontend
+sudo docker compose exec nginx nginx -t
+sudo docker compose exec nginx nginx -s reload
 ```
 
-浏览器打开：
+确认 Nginx 和反向代理均正常：
 
-```text
-http://example.com/login
+```bash
+curl http://127.0.0.1/nginx-health
+curl -I http://127.0.0.1/login
+sudo docker compose exec nginx wget -qO- http://frontend:3000/login >/dev/null
 ```
+
+此时可以通过 `http://服务器公网IP/login` 访问。生产环境应继续配置域名和 HTTPS。
 
 ## 7. 配置 HTTPS
 
-确保域名 A 记录已指向这台 Ubuntu 服务器，且安全组放行 `80` 和 `443`。
+确保域名 A 记录已指向这台 Ubuntu 服务器，且安全组放行 `80` 和 `443`。将下面两个变量替换为真实域名和邮箱：
 
 ```bash
-sudo snap install --classic certbot
-sudo ln -sf /snap/bin/certbot /usr/local/bin/certbot
-sudo certbot --nginx -d example.com
-sudo certbot renew --dry-run
+cd /opt/gys-frontend
+export DOMAIN=example.com
+export EMAIL=admin@example.com
+
+sudo docker compose --profile tools run --rm certbot certonly \
+  --webroot --webroot-path /var/www/certbot \
+  --email "$EMAIL" --agree-tos --no-eff-email \
+  -d "$DOMAIN"
+```
+
+证书会写入宿主机的 `nginx/certbot/conf`。然后启用仓库中的 HTTPS 配置模板：
+
+```bash
+sudo cp nginx/conf.d/https.conf.example nginx/conf.d/default.conf
+sudo sed -i "s/example.com/$DOMAIN/g" nginx/conf.d/default.conf
+sudo docker compose exec nginx nginx -t
+sudo docker compose restart nginx
 ```
 
 完成后访问：
@@ -200,22 +210,37 @@ sudo certbot renew --dry-run
 https://example.com/login
 ```
 
+手动续期与重载：
+
+```bash
+sudo docker compose --profile tools run --rm certbot renew
+sudo docker compose exec nginx nginx -s reload
+```
+
+可在 root 的 crontab 中每天检查一次续期：
+
+```cron
+0 3 * * * cd /opt/gys-frontend && /usr/bin/docker compose --profile tools run --rm certbot renew --quiet && /usr/bin/docker compose exec -T nginx nginx -s reload
+```
+
 ## 8. 防火墙注意事项
 
-Docker 在 Linux 中会创建自己的 iptables/nftables 规则，直接发布的容器端口可能绕过 UFW 的常规规则。本项目使用：
+Docker 在 Linux 中会创建自己的 iptables/nftables 规则，直接发布的容器端口可能绕过 UFW 的常规规则。本项目只发布：
 
 ```yaml
 ports:
-  - "127.0.0.1:3000:3000"
+  - "80:8080"
+  - "443:8443"
 ```
 
-因此 `3000` 只能从 Ubuntu 本机访问，公网流量必须经过 Nginx。不要改成 `3000:3000`，除非你明确需要直接对公网开放并已配置 `DOCKER-USER` 防火墙链。
+前端的 `3000` 没有宿主机映射，公网流量必须经过 Nginx。不要给 `frontend` 添加 `3000:3000`，除非你明确需要直接对公网开放并已配置 `DOCKER-USER` 防火墙链。
 
 如使用 UFW：
 
 ```bash
 sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
 sudo ufw enable
 sudo ufw status
 ```
@@ -235,10 +260,11 @@ sudo docker image tag gys-frontend:latest gys-frontend:rollback
 
 ```bash
 git pull --ff-only origin main
-sudo docker compose build --pull
+sudo docker compose pull nginx
+sudo docker compose build --pull frontend
 sudo docker compose up -d --remove-orphans
 sudo docker compose ps
-sudo docker compose logs --tail=100 frontend
+sudo docker compose logs --tail=100 frontend nginx
 ```
 
 确认新版正常后可清理无用构建缓存和悬空镜像：
@@ -267,10 +293,10 @@ sudo docker compose ps
 sudo docker compose ps
 
 # 实时日志
-sudo docker compose logs -f frontend
+sudo docker compose logs -f frontend nginx
 
 # 重启
-sudo docker compose restart frontend
+sudo docker compose restart frontend nginx
 
 # 停止
 sudo docker compose stop
@@ -290,7 +316,7 @@ sudo docker stats gys-frontend
 ### 镜像构建失败
 
 ```bash
-sudo docker compose build --no-cache --pull
+sudo docker compose build --no-cache --pull frontend
 ```
 
 如果失败在 `npm ci`，检查服务器到 npm 仓库的网络。如果失败在 `npm run build`，保留完整构建日志。
@@ -306,11 +332,11 @@ sudo docker compose logs --tail=200 frontend
 ### Nginx 显示 502
 
 ```bash
-curl -I http://127.0.0.1:3000/login
+curl http://127.0.0.1/nginx-health
 sudo docker compose ps
-sudo docker compose logs --tail=200 frontend
-sudo nginx -t
-sudo tail -n 100 /var/log/nginx/error.log
+sudo docker compose logs --tail=200 frontend nginx
+sudo docker compose exec nginx nginx -t
+sudo docker compose exec nginx wget -qO- http://frontend:3000/login >/dev/null
 ```
 
 ### 页面能打开，但登录或数据加载失败
@@ -326,13 +352,13 @@ sudo docker exec gys-frontend node -e \
 
 ## 13. 发布验收清单
 
-1. `sudo docker compose ps` 显示容器为 `Up` 和 `healthy`。
-2. `curl -I http://127.0.0.1:3000/login` 返回正常状态。
+1. `sudo docker compose ps` 显示 `gys-frontend` 和 `gys-nginx` 均为 `Up` 和 `healthy`。
+2. `curl -I http://127.0.0.1/login` 返回正常状态。
 3. `https://example.com/login` 能显示登录页。
 4. 登录、退出、上传密钥与错误提示正常。
 5. 控制台、我的渠道、消费快照能加载原站数据。
 6. 中英文切换和手机端布局正常。
-7. `sudo certbot renew --dry-run` 通过。
+7. `sudo docker compose --profile tools run --rm certbot renew --dry-run` 通过。
 
 ## 官方参考
 
@@ -342,4 +368,5 @@ sudo docker exec gys-frontend node -e \
 - [Docker packet filtering and UFW](https://docs.docker.com/engine/network/packet-filtering-firewalls/)
 - [Docker Compose services](https://docs.docker.com/reference/compose-file/services/)
 - [Nginx reverse proxy](https://nginx.org/en/docs/http/ngx_http_proxy_module.html)
-- [Certbot with Nginx](https://certbot.eff.org/instructions?ws=nginx&os=ubuntufocal)
+- [Certbot Docker installation](https://eff-certbot.readthedocs.io/en/stable/install.html#alternative-1-docker)
+- [Certbot webroot authentication](https://eff-certbot.readthedocs.io/en/stable/using.html#webroot)

@@ -9,6 +9,8 @@ node_modules
 out
 outputs
 work
+nginx/certbot/conf
+nginx/certbot/www
 
 .env
 .env.*
