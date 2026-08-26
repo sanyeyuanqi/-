@@ -39,7 +39,7 @@ import type { ComponentType, CSSProperties, FormEvent, ReactNode } from 'react';
 import { Fragment, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
 type ApiEnvelope<T> = {
-  code?: number;
+  code?: number | string;
   success?: boolean;
   data?: T;
   message?: string;
@@ -744,6 +744,89 @@ const API_CACHE_TTL = 12_000;
 const apiCache = new Map<string, { expiresAt: number; value: unknown }>();
 const pendingApiRequests = new Map<string, Promise<unknown>>();
 const USER_CACHE_KEY = 'gys:profile';
+const AUTH_MESSAGE_KEY = 'gys:auth-message';
+let authRedirectPending = false;
+
+const apiCodeMessages: Record<number, string> = {
+  40001: '请求参数错误',
+  40101: 'API Key 缺失、无效或已停用',
+  40301: '当前 Key 缺少所需权限',
+  40401: '资源不存在',
+  50001: '服务器内部错误',
+};
+
+const apiCodeStatuses: Record<number, number> = {
+  0: 200,
+  40001: 400,
+  40101: 401,
+  40301: 403,
+  40401: 404,
+  50001: 500,
+};
+
+class ApiRequestError extends Error {
+  code?: number;
+  status: number;
+  requestId?: string;
+
+  constructor(message: string, status: number, code?: number, requestId?: string) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
+  }
+}
+
+function normalizeApiCode(code: ApiEnvelope<unknown>['code']) {
+  if (typeof code === 'number' && Number.isFinite(code)) return code;
+  if (typeof code === 'string' && code.trim()) {
+    const parsed = Number(code);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function getApiErrorMessage(payload: ApiEnvelope<unknown>, status: number, code?: number) {
+  const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+  if (message) return message;
+  if (code && apiCodeMessages[code]) return apiCodeMessages[code];
+  if (status === 401) return '登录状态已失效，请重新登录';
+  if (status === 403) return '当前账号没有操作权限';
+  if (status === 404) return '请求的资源不存在';
+  if (status >= 500) return '服务器内部错误';
+  return `请求失败：${status}`;
+}
+
+function redirectToLogin(path: string, message: string) {
+  if (typeof window === 'undefined' || path.startsWith('/api/auth/login')) return;
+
+  clearCachedUser();
+  apiCache.clear();
+
+  if (window.location.pathname === '/login') return;
+
+  try {
+    sessionStorage.setItem(AUTH_MESSAGE_KEY, message);
+  } catch {
+    // The redirect still works when browser storage is unavailable.
+  }
+
+  authRedirectPending = true;
+  window.location.replace('/login');
+}
+
+function takeAuthMessage() {
+  if (typeof window === 'undefined') return '';
+
+  try {
+    const message = sessionStorage.getItem(AUTH_MESSAGE_KEY) || '';
+    sessionStorage.removeItem(AUTH_MESSAGE_KEY);
+    return message;
+  } catch {
+    return '';
+  }
+}
 
 function roleLabel(role?: string, language: Language = 'zh') {
   if (role === 'admin') return language === 'en' ? 'Administrator' : '管理员';
@@ -907,19 +990,54 @@ async function api<T>(path: string, init: ApiRequestInit = {}): Promise<T> {
       cache: 'no-store',
     });
     const contentType = response.headers.get('content-type') || '';
-    const payload = contentType.includes('application/json')
-      ? ((await response.json()) as ApiEnvelope<T>)
-      : ({ data: await response.text(), success: response.ok } as ApiEnvelope<T>);
+    let payload: ApiEnvelope<T>;
+
+    if (contentType.includes('application/json')) {
+      try {
+        const parsed = await response.json();
+        payload = parsed && typeof parsed === 'object'
+          ? (parsed as ApiEnvelope<T>)
+          : ({ data: parsed as T, success: response.ok } as ApiEnvelope<T>);
+      } catch {
+        payload = { success: response.ok };
+      }
+    } else {
+      payload = { data: (await response.text()) as T, success: response.ok };
+    }
+
+    const code = normalizeApiCode(payload.code);
+    const status = code === undefined ? response.status : (apiCodeStatuses[code] ?? response.status);
+    const message = getApiErrorMessage(payload, status, code);
+    const unauthorized = status === 401;
+
+    if (unauthorized) {
+      redirectToLogin(path, message);
+      throw new ApiRequestError(message, status, code, payload.request_id);
+    }
 
     if (
       !response.ok ||
       payload.success === false ||
-      (typeof payload.code === 'number' && payload.code !== 0)
+      (code !== undefined && code !== 0)
     ) {
-      throw new Error(payload.message || `请求失败：${response.status}`);
+      throw new ApiRequestError(message, status, code, payload.request_id);
     }
 
-    const data = (payload.data ?? payload) as T;
+    let data = (payload.data ?? payload) as T;
+    if (
+      code === 0 &&
+      payload.data !== undefined &&
+      data &&
+      typeof data === 'object' &&
+      !Array.isArray(data)
+    ) {
+      const objectData = data as Record<string, unknown>;
+      data = {
+        ...objectData,
+        message: objectData.message ?? payload.message,
+        request_id: objectData.request_id ?? payload.request_id,
+      } as T;
+    }
     if (cacheable) {
       apiCache.set(cacheKey, { expiresAt: Date.now() + API_CACHE_TTL, value: data });
     } else {
@@ -1014,6 +1132,11 @@ function LoginScreen({ onLogin }: { onLogin: (user: UserProfile) => void }) {
           showPassword: 'Show password',
           hidePassword: 'Hide password',
         };
+
+  useEffect(() => {
+    const authMessage = takeAuthMessage();
+    if (authMessage) setNotice({ type: 'error', text: authMessage });
+  }, []);
 
   useEffect(() => {
     if (!notice) return;
@@ -1389,6 +1512,7 @@ function DashboardView({ setView }: { setView: (view: ViewKey) => void }) {
   const { language, t } = useLanguage();
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const channels = data?.channels || {};
   const role = data?.role;
   const healthRate = channels.avg_sr;
@@ -1413,10 +1537,15 @@ function DashboardView({ setView }: { setView: (view: ViewKey) => void }) {
 
   async function load(fresh = false) {
     setLoading(true);
+    setNotice(null);
     try {
       setData(await api<DashboardData>('/api/dashboard', { fresh }));
-    } catch {
+    } catch (error) {
       setData(null);
+      setNotice({
+        type: 'error',
+        text: error instanceof Error ? error.message : t('加载控制台失败'),
+      });
     } finally {
       setLoading(false);
     }
@@ -1428,6 +1557,7 @@ function DashboardView({ setView }: { setView: (view: ViewKey) => void }) {
 
   return (
     <section className="dashboard-page">
+      <NoticeBanner notice={notice} />
       <div className="dashboard-hero">
         <div>
           <h1>
@@ -1751,8 +1881,14 @@ function UploadView() {
             : current,
         );
       })
-      .catch(() => setSwitchData({ enabled: true }));
-  }, []);
+      .catch((error) => {
+        setSwitchData({ enabled: true });
+        setNotice({
+          type: 'error',
+          text: error instanceof Error ? error.message : t('加载上传设置失败'),
+        });
+      });
+  }, [t]);
 
   useEffect(() => {
     api<{ category: string; models: string[] }>(
@@ -1762,11 +1898,15 @@ function UploadView() {
         setModels(data.models || []);
         setSelectedModels(data.models || []);
       })
-      .catch(() => {
+      .catch((error) => {
         setModels([]);
         setSelectedModels([]);
+        setNotice({
+          type: 'error',
+          text: error instanceof Error ? error.message : t('加载模型列表失败'),
+        });
       });
-  }, [category]);
+  }, [category, t]);
 
   useEffect(() => {
     if (!notice) return;
@@ -3728,10 +3868,13 @@ function SupplierApplication() {
         setUser(nextUser);
       })
       .catch(() => {
+        if (authRedirectPending) return;
         clearCachedUser();
         setUser(null);
       })
-      .finally(() => setAuthLoading(false));
+      .finally(() => {
+        if (!authRedirectPending) setAuthLoading(false);
+      });
   }, []);
 
   async function logout() {
