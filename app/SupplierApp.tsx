@@ -37,6 +37,7 @@ import {
 } from 'lucide-react';
 import type { ComponentType, CSSProperties, FormEvent, ReactNode } from 'react';
 import { Fragment, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import LoginCaptcha from './LoginCaptcha';
 
 type ApiEnvelope<T> = {
   code?: number | string;
@@ -333,6 +334,10 @@ const englishTranslations: Record<string, string> = {
   '该渠道没有可测试的模型': 'This channel has no models available for testing',
   '确定启用该渠道？': 'Enable this channel?',
   '确定停用该渠道？': 'Disable this channel?',
+  '确认启用渠道': 'Enable Channel',
+  '确认停用渠道': 'Disable Channel',
+  '确认删除渠道': 'Delete Channel',
+  '处理中...': 'Processing...',
   '渠道已启用': 'Channel enabled',
   '渠道已停用': 'Channel disabled',
   '启用渠道失败': 'Failed to enable the channel',
@@ -1107,6 +1112,10 @@ function LoginScreen({ onLogin }: { onLogin: (user: UserProfile) => void }) {
   const [fieldErrors, setFieldErrors] = useState({ username: '', password: '' });
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [captchaOpen, setCaptchaOpen] = useState(false);
+  const credentialsRef = useRef<{ username: string; password: string } | null>(null);
+  const submittingRef = useRef(false);
+  const loginControllerRef = useRef<AbortController | null>(null);
 
   const copy =
     language === 'zh'
@@ -1120,6 +1129,7 @@ function LoginScreen({ onLogin }: { onLogin: (user: UserProfile) => void }) {
           failed: '登录失败',
           showPassword: '显示密码',
           hidePassword: '隐藏密码',
+          captchaConfigFailed: '无法获取登录验证配置，请重试',
         }
       : {
           title: 'Supplier Management System',
@@ -1131,11 +1141,16 @@ function LoginScreen({ onLogin }: { onLogin: (user: UserProfile) => void }) {
           failed: 'Login failed',
           showPassword: 'Show password',
           hidePassword: 'Hide password',
+          captchaConfigFailed: 'Unable to load login verification settings. Please try again.',
         };
 
   useEffect(() => {
     const authMessage = takeAuthMessage();
     if (authMessage) setNotice({ type: 'error', text: authMessage });
+    return () => {
+      credentialsRef.current = null;
+      loginControllerRef.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -1147,6 +1162,7 @@ function LoginScreen({ onLogin }: { onLogin: (user: UserProfile) => void }) {
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (submittingRef.current || captchaOpen) return;
     const nextErrors = {
       username: username.trim() ? '' : copy.usernameRequired,
       password: password ? '' : copy.passwordRequired,
@@ -1154,20 +1170,39 @@ function LoginScreen({ onLogin }: { onLogin: (user: UserProfile) => void }) {
     setFieldErrors(nextErrors);
     if (nextErrors.username || nextErrors.password) return;
 
+    submittingRef.current = true;
     setLoading(true);
     setNotice(null);
+    const credentials = { username, password };
+    const controller = new AbortController();
+    loginControllerRef.current = controller;
     try {
+      const config = await api<{ enabled: boolean }>('/api/auth/login-captcha', {
+        fresh: true,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      if (typeof config?.enabled !== 'boolean') throw new Error(copy.captchaConfigFailed);
+      if (config.enabled) {
+        credentialsRef.current = credentials;
+        setCaptchaOpen(true);
+        return;
+      }
       const user = await api<UserProfile>('/api/auth/login', {
         method: 'POST',
-        body: { username, password },
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(credentials),
+        signal: controller.signal,
       });
-      onLogin(user);
+      if (!controller.signal.aborted) onLogin(user);
     } catch (error) {
+      if (controller.signal.aborted) return;
       setNotice({
         type: 'error',
         text: error instanceof Error ? error.message : copy.failed,
       });
     } finally {
+      submittingRef.current = false;
       setLoading(false);
     }
   }
@@ -1253,6 +1288,30 @@ function LoginScreen({ onLogin }: { onLogin: (user: UserProfile) => void }) {
           </button>
         </form>
       </section>
+      {captchaOpen && (
+        <LoginCaptcha
+          language={language}
+          request={api}
+          onClose={() => {
+            credentialsRef.current = null;
+            setCaptchaOpen(false);
+          }}
+          onVerified={async (token, signal) => {
+            const credentials = credentialsRef.current;
+            if (!credentials || signal.aborted) return;
+            const user = await api<UserProfile>('/api/auth/login', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ ...credentials, captcha_token: token }),
+              signal,
+            });
+            if (signal.aborted) return;
+            credentialsRef.current = null;
+            setCaptchaOpen(false);
+            onLogin(user);
+          }}
+        />
+      )}
     </main>
   );
 }
@@ -2333,6 +2392,11 @@ function MyChannelsView() {
   const [keywordsLoading, setKeywordsLoading] = useState(false);
   const [keywordSaving, setKeywordSaving] = useState(false);
   const [rowAction, setRowAction] = useState<{ id: number; type: 'status' | 'delete' } | null>(null);
+  const [channelConfirmation, setChannelConfirmation] = useState<{
+    item: ChannelItem;
+    type: 'status' | 'delete';
+    nextStatus?: number;
+  } | null>(null);
   const [testChannelItem, setTestChannelItem] = useState<ChannelItem | null>(null);
   const [testMode, setTestMode] = useState<'newapi' | 'direct'>('direct');
   const [testContent, setTestContent] = useState('');
@@ -2417,6 +2481,8 @@ function MyChannelsView() {
   const testSuccessCount = testResults.filter((result) => result.success).length;
   const testHasMultipleInstances = testResults.some((result) => result.instance_id)
     && new Set(testResults.map((result) => result.instance_id)).size > 1;
+  const channelConfirmationBusy = !!channelConfirmation
+    && rowAction?.id === channelConfirmation.item.id;
 
   function changeView(nextView: 'group' | 'list') {
     if (nextView === viewMode) return;
@@ -2631,10 +2697,25 @@ function MyChannelsView() {
     setTestLoading(false);
   }
 
-  async function changeChannelStatus(item: ChannelItem) {
-    const nextStatus = item.status === 1 ? 2 : 1;
+  function requestChannelStatusChange(item: ChannelItem) {
+    setChannelConfirmation({
+      item,
+      type: 'status',
+      nextStatus: item.status === 1 ? 2 : 1,
+    });
+  }
+
+  function requestChannelDelete(item: ChannelItem) {
+    setChannelConfirmation({ item, type: 'delete' });
+  }
+
+  function closeChannelConfirmation() {
+    if (channelConfirmationBusy) return;
+    setChannelConfirmation(null);
+  }
+
+  async function changeChannelStatus(item: ChannelItem, nextStatus: number) {
     const actionLabel = nextStatus === 1 ? '启用' : '停用';
-    if (!window.confirm(t(`确定${actionLabel}该渠道？`))) return;
 
     setRowAction({ id: item.id, type: 'status' });
     setNotice(null);
@@ -2651,12 +2732,11 @@ function MyChannelsView() {
       setNotice({ type: 'error', text: error instanceof Error ? error.message : t(`${actionLabel}渠道失败`) });
     } finally {
       setRowAction(null);
+      setChannelConfirmation(null);
     }
   }
 
   async function deleteChannel(item: ChannelItem) {
-    if (!window.confirm(t('确定删除？将同步用量并禁用上游渠道，删除后不可恢复。'))) return;
-
     setRowAction({ id: item.id, type: 'delete' });
     setNotice(null);
     try {
@@ -2667,7 +2747,21 @@ function MyChannelsView() {
       setNotice({ type: 'error', text: error instanceof Error ? error.message : t('删除渠道失败') });
     } finally {
       setRowAction(null);
+      setChannelConfirmation(null);
     }
+  }
+
+  function confirmChannelAction() {
+    if (!channelConfirmation || channelConfirmationBusy) return;
+    if (channelConfirmation.type === 'delete') {
+      void deleteChannel(channelConfirmation.item);
+      return;
+    }
+
+    void changeChannelStatus(
+      channelConfirmation.item,
+      channelConfirmation.nextStatus ?? 1,
+    );
   }
 
   return (
@@ -2937,7 +3031,7 @@ function MyChannelsView() {
                           <button
                             className={item.status === 1 ? '' : 'enable'}
                             disabled={rowAction?.id === item.id}
-                            onClick={() => changeChannelStatus(item)}
+                            onClick={() => requestChannelStatusChange(item)}
                             type="button"
                           >
                             {rowAction?.id === item.id && rowAction.type === 'status'
@@ -2952,7 +3046,7 @@ function MyChannelsView() {
                           <button
                             className="danger"
                             disabled={rowAction?.id === item.id}
-                            onClick={() => deleteChannel(item)}
+                            onClick={() => requestChannelDelete(item)}
                             type="button"
                           >
                             {rowAction?.id === item.id && rowAction.type === 'delete'
@@ -3013,6 +3107,93 @@ function MyChannelsView() {
               <option value={100}>{t('{{count}} 条/页', { count: 100 })}</option>
             </select>
           </div>
+        </div>
+      )}
+
+      {channelConfirmation && (
+        <div
+          className="dialog-backdrop channel-confirm-backdrop"
+          onMouseDown={closeChannelConfirmation}
+          role="presentation"
+        >
+          <section
+            aria-labelledby="channel-confirm-title"
+            aria-modal="true"
+            className={`channel-confirm-dialog ${channelConfirmation.type} ${
+              channelConfirmation.type === 'status'
+                ? channelConfirmation.nextStatus === 1 ? 'enable' : 'disable'
+                : ''
+            }`}
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <header className="channel-confirm-header">
+              <span className="channel-confirm-icon" aria-hidden="true">
+                {channelConfirmation.type === 'delete'
+                  ? <Trash2 size={19} />
+                  : channelConfirmation.nextStatus === 1
+                    ? <CheckCircle2 size={19} />
+                    : <AlertTriangle size={19} />}
+              </span>
+              <div className="channel-confirm-heading">
+                <h2 id="channel-confirm-title">
+                  {channelConfirmation.type === 'delete'
+                    ? t('确认删除渠道')
+                    : channelConfirmation.nextStatus === 1
+                      ? t('确认启用渠道')
+                      : t('确认停用渠道')}
+                </h2>
+              </div>
+              <button
+                aria-label={t('关闭')}
+                className="channel-confirm-close"
+                disabled={channelConfirmationBusy}
+                onClick={closeChannelConfirmation}
+                type="button"
+              >
+                <X size={18} />
+              </button>
+            </header>
+
+            <div className="channel-confirm-body">
+              <p>
+                {channelConfirmation.type === 'delete'
+                  ? t('确定删除？将同步用量并禁用上游渠道，删除后不可恢复。')
+                  : channelConfirmation.nextStatus === 1
+                    ? t('确定启用该渠道？')
+                    : t('确定停用该渠道？')}
+              </p>
+              <div className="channel-confirm-target">
+                <span>{t('渠道')}</span>
+                <strong>
+                  {channelConfirmation.item.channel_name
+                    || channelConfirmation.item.name
+                    || `#${channelConfirmation.item.id}`}
+                </strong>
+                <code>ID {channelConfirmation.item.id}</code>
+              </div>
+            </div>
+
+            <footer className="channel-confirm-footer">
+              <button
+                className="ghost-button"
+                disabled={channelConfirmationBusy}
+                onClick={closeChannelConfirmation}
+                type="button"
+              >
+                {t('取消')}
+              </button>
+              <button
+                className={`channel-confirm-submit ${channelConfirmation.type === 'delete' ? 'danger' : ''}`}
+                disabled={channelConfirmationBusy}
+                onClick={confirmChannelAction}
+                type="button"
+              >
+                {channelConfirmationBusy && <Loader2 className="spin" size={15} />}
+                {channelConfirmationBusy ? t('处理中...') : t('确定')}
+              </button>
+            </footer>
+          </section>
         </div>
       )}
 
